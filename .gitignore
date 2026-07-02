@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# 가상환경
+venv/
+env/
+.venv/
+
+# 모델 가중치 (대용량)
+*.onnx
+*.pt
+*.pth
+checkpoints/
+
+# 등록 얼굴 이미지 (개인 생체정보)
+registered_faces/
+
+# 데이터베이스
+*.db
+*.sqlite3
+
+# 디버그/임시 파일
+debug_*.jpg
+debug_*.png
+diag_*.jpg
+test_restore_result.jpg
+
+# 영상 (대용량 — 코랩엔 직접 업로드)
+*.mp4
+
+# 녹화 청크 / 임시 큐
+recordings/
+pending/
+
+# 환경변수
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
