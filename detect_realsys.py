@@ -75,14 +75,6 @@ def put_korean_text(img, text, position, font_size, color):
 def draw_green_circle(img, center, size=6):
     cv2.circle(img, center, size, (0, 255, 0), -1)
 
-def draw_yellow_triangle(img, center, size=6):
-    cx, cy = center
-    pts = np.array([
-        [cx, cy - size],
-        [cx - size, cy + size],
-        [cx + size, cy + size]
-    ], np.int32)
-    cv2.fillPoly(img, [pts], (0, 255, 255))
 
 def draw_red_x(img, center, size=6, thickness=2):
     cx, cy = center
@@ -152,9 +144,6 @@ def run_security_camera():
                 if best_group == "허가":
                     color = (0, 255, 0)
                     marker_func = draw_green_circle
-                elif best_group == "준허가":
-                    color = (0, 255, 255)
-                    marker_func = draw_yellow_triangle
                 else:
                     color = (0, 0, 255)
                     marker_func = draw_red_x

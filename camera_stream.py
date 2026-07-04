@@ -6,6 +6,9 @@ import io
 import os
 import threading
 import sqlite3
+import time
+import queue
+from collections import deque
 
 import cv2
 import numpy as np
@@ -88,12 +91,32 @@ class CameraProcessor:
     - get_jpeg(): 최신 처리 프레임을 JPEG bytes로 반환
     """
 
+    def _load_models(self):
+        """Hailo-8L NPU 가속기 및 CPU 폴백 모델 로드"""
+        use_hailo = getattr(c, "USE_HAILO", False)
+        if use_hailo:
+            try:
+                from hailo_infer import HAILO_AVAILABLE, HailoSCRFD, HailoArcFace
+                if not HAILO_AVAILABLE:
+                    raise RuntimeError("hailo_platform 미설치")
+                det = HailoSCRFD(
+                    c.SCRFD_HEF_PATH,
+                    conf_thresh=getattr(c, "HAILO_DET_THRESH", 0.5),
+                )
+                rec = HailoArcFace(c.ARCFACE_HEF_PATH)
+                print("[CameraProcessor] ⚡ Hailo-8L 가속 사용 (SCRFD+ArcFace)")
+                return det, rec
+            except Exception as e:
+                print(f"[CameraProcessor] Hailo 사용 불가({e}) → insightface 폴백")
+
+        fa = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
+        fa.prepare(ctx_id=-1, det_thresh=0.6)
+        print("[CameraProcessor] insightface(CPU) 사용")
+        return fa.models["detection"], fa.models["recognition"]
+
     def __init__(self):
         print("[CameraProcessor] 모델 로드 중...")
-        fa = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
-        fa.prepare(ctx_id=-1, det_thresh=0.4)
-        self.detector = fa.models["detection"]
-        self.recognizer = fa.models["recognition"]
+        self.detector, self.recognizer = self._load_models()
 
         if c.INN_CHECKPOINT:
             self._anonymizer = INNAnonymizer(checkpoint_path=c.INN_CHECKPOINT)
@@ -113,6 +136,13 @@ class CameraProcessor:
 
         self._tiles_lock = threading.Lock()
         self._latest_tiles: list = []   # [{"tile_f32": ndarray, "crop_box": list}]
+
+        # 디스크 대신 메모리 큐 사용 (INN 대기)
+        self._pending_lock = threading.Lock()
+        self._pending_records = []
+        self._pending_max = int(
+            getattr(c, "CHUNK_SECONDS", 60) * getattr(c, "SAVE_FPS", 1)
+        ) or 1
 
         self._stats_lock = threading.Lock()
         self._stats = {"employee_count": 0, "unknown_count": 0, "recording": True}
@@ -167,8 +197,6 @@ class CameraProcessor:
             tiles = list(self._latest_tiles)
         return {"jpeg": jpeg, "tiles": tiles}
 
-    # ── 캡처 루프 ─────────────────────────────────────────────────────────
-
     def get_debug_info(self) -> dict:
         with self._frame_lock:
             size = len(self._latest_jpeg) if self._latest_jpeg else 0
@@ -183,11 +211,6 @@ class CameraProcessor:
     # ── 전용 프레임 리더 (블로킹 cap.read 격리) ──────────────────────────────
 
     def _start_frame_reader(self, cap) -> "queue.Queue":
-        """
-        별도 스레드에서 cap.read()를 수행하고 결과를 Queue에 넣는다.
-        Windows MSMF/DSHOW에서 cap.read()가 무한 블로킹하는 문제를 우회.
-        """
-        import queue
         q: "queue.Queue" = queue.Queue(maxsize=2)
 
         def _reader():
@@ -202,10 +225,33 @@ class CameraProcessor:
         t.start()
         return q
 
-    def _loop(self, cam_id: int):
-        import time
+    def _find_camera_index(self, preferred: int = 0) -> int:
+        candidates = [preferred] + [i for i in range(9) if i != preferred]
+        for idx in candidates:
+            try:
+                cap = cv2.VideoCapture(idx)
+            except Exception:
+                continue
+            if not cap.isOpened():
+                cap.release()
+                continue
+            found = False
+            for _ in range(15):
+                ret, f = cap.read()
+                if (ret and f is not None and f.ndim == 3
+                        and f.shape[2] == 3 and float(f.mean()) > 3):
+                    found = True
+                    break
+            cap.release()
+            if found:
+                print(f"[Camera] 자동 선택: 인덱스 {idx} (컬러 영상 확인)")
+                return idx
+        print(f"[Camera] 컬러 카메라 자동탐색 실패 → 인덱스 {preferred} 사용")
+        return preferred
 
-        # FORCE_VIDEO: 카메라 대신 폴백 영상 사용
+    # ── 캡처 루프 ─────────────────────────────────────────────────────────
+
+    def _loop(self, cam_id: int):
         if getattr(c, "FORCE_VIDEO", False):
             fallback = getattr(c, "VIDEO_FALLBACK", None)
             if fallback and os.path.exists(fallback):
@@ -213,12 +259,11 @@ class CameraProcessor:
                 self._video_loop(fallback)
                 return
 
-        # RealSense 카메라면 전용 루프
         if getattr(c, "CAMERA_TYPE", "webcam") == "realsense":
             self._realsense_loop()
             return
 
-        # ── 카메라 열기 ──
+        cam_id = self._find_camera_index(cam_id)
         cap = cv2.VideoCapture(cam_id)
         if not cap.isOpened():
             print(f"[Camera] 카메라 {cam_id} 열기 실패 → 5초 후 재시도")
@@ -226,7 +271,7 @@ class CameraProcessor:
             time.sleep(5)
             self._loop(cam_id)
             return
-        # 버퍼 최소화 (지연 감소)
+            
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -234,32 +279,44 @@ class CameraProcessor:
 
         print(f"[Camera] 카메라 {cam_id} 열림")
 
-        # ── 리더 스레드: 항상 '최신' 프레임만 보관 (버퍼 누적 지연 제거) ──
         state = {"frame": None, "run": True, "first": True}
         rlock = threading.Lock()
 
+        save_fps = getattr(c, "SAVE_FPS", 1)
+        save_dt = (1.0 / save_fps) if save_fps and save_fps > 0 else 0.0
+
         def _reader():
+            last_save = 0.0
             while state["run"] and self._running:
                 ret, f = cap.read()
                 if not ret or f is None:
                     continue
                 f = cv2.flip(f, 1)
-                # 등록용 원본은 매 프레임 갱신
+                
                 _okr, _bufr = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 if _okr:
                     with self._frame_lock:
                         self._latest_raw_jpeg = _bufr.tobytes()
                 with rlock:
-                    state["frame"] = f  # 이전 미처리 프레임은 덮어씀(드롭)
+                    state["frame"] = f
+
+                now = time.time()
+                with self._pending_lock:
+                    if (save_dt == 0.0 or (now - last_save) >= save_dt) \
+                            and len(self._pending_records) < self._pending_max:
+                        last_save = now
+                        self._pending_records.append((f.copy(), now))
 
         threading.Thread(target=_reader, daemon=True).start()
 
-        every_n = max(1, getattr(c, "PROCESS_EVERY_N", 1))
-        frame_count = 0
+        max_fps = getattr(c, "PROCESS_MAX_FPS", 15)
+        min_dt = (1.0 / max_fps) if max_fps and max_fps > 0 else 0.0
+        last_proc = 0.0
         while self._running:
             with rlock:
                 frame = state["frame"]
-                state["frame"] = None  # 소비 → 다음 새 프레임까지 대기
+                state["frame"] = None
+                
             if frame is None:
                 time.sleep(0.005)
                 continue
@@ -268,9 +325,11 @@ class CameraProcessor:
                 state["first"] = False
                 print(f"[Camera] 첫 프레임 수신 {frame.shape}")
 
-            frame_count += 1
-            if frame_count % every_n != 0:
+            now = time.time()
+            if min_dt > 0 and (now - last_proc) < min_dt:
+                time.sleep(0.002)
                 continue
+            last_proc = now
 
             frame = self._maybe_downscale(frame)
             try:
@@ -293,11 +352,6 @@ class CameraProcessor:
         print(f"[Camera] 카메라 {cam_id} 종료")
 
     def _realsense_loop(self):
-        """
-        Intel RealSense (D455 등) 컬러 스트림으로 프레임을 받아 처리.
-        cv2.VideoCapture 대신 pyrealsense2 파이프라인 사용.
-        """
-        import time
         try:
             import pyrealsense2 as rs
         except ImportError:
@@ -328,25 +382,23 @@ class CameraProcessor:
         try:
             while self._running:
                 try:
-                    frames = pipeline.wait_for_frames(2000)  # 2초 타임아웃
+                    frames = pipeline.wait_for_frames(2000)
                 except Exception:
                     continue
                 color = frames.get_color_frame()
                 if not color:
                     continue
 
-                frame = np.asanyarray(color.get_data())  # HWC BGR uint8
+                frame = np.asanyarray(color.get_data())
                 frame_count += 1
                 if frame_count == 1:
                     print(f"[Camera] RealSense 첫 프레임 {frame.shape}")
 
-                # 익명화 전 원본 저장 (등록용) — 매 프레임
                 _okr, _bufr = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 if _okr:
                     with self._frame_lock:
                         self._latest_raw_jpeg = _bufr.tobytes()
 
-                # N프레임마다만 무거운 처리
                 if frame_count % every_n != 0:
                     continue
 
@@ -370,13 +422,6 @@ class CameraProcessor:
             print("[Camera] RealSense 종료")
 
     def _video_loop(self, video_path: str):
-        """
-        폴백: mp4 등 동영상 파일을 카메라처럼 처리.
-        - 각 프레임에 탐지/인식/익명화 적용 (카메라와 동일)
-        - 영상이 끝나면 처음부터 다시 재생 (무한 루프)
-        """
-        import time
-
         fps = getattr(c, "VIDEO_FALLBACK_FPS", 25)
         delay = 1.0 / max(1, fps)
 
@@ -392,7 +437,6 @@ class CameraProcessor:
             t0 = time.time()
             ret, frame = cap.read()
             if not ret or frame is None:
-                # 영상 끝 → 처음으로 되감기
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
 
@@ -403,7 +447,6 @@ class CameraProcessor:
                 print(f"[Video] _process 오류 (건너뜀): {e}")
                 emp, unk = 0, 0
 
-            # 폴백 영상 표시 (데모용 표식)
             cv2.putText(frame, f"DEMO (video) F{frame_count}",
                         (10, frame.shape[0] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
@@ -417,7 +460,6 @@ class CameraProcessor:
                 with self._frame_lock:
                     self._latest_jpeg = buf.tobytes()
 
-            # 처리 시간만큼 빼서 보정 — 처리가 이미 느리면 sleep 안 함
             elapsed = time.time() - t0
             if elapsed < delay:
                 time.sleep(delay - elapsed)
@@ -426,7 +468,6 @@ class CameraProcessor:
         print("[Video] 폴백 영상 종료")
 
     def _show_reconnecting(self):
-        """재연결 대기 중 화면을 JPEG 버퍼에 공급."""
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
         frame[:] = (30, 30, 40)
         cv2.putText(frame, "Reconnecting...", (160, 230),
@@ -438,10 +479,8 @@ class CameraProcessor:
             self._latest_jpeg = buf.tobytes()
 
     def _dummy_loop(self):
-        """카메라 없을 때 대기 화면을 MJPEG 버퍼에 계속 공급."""
-        import time
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        frame[:] = (30, 30, 40)  # 어두운 배경
+        frame[:] = (30, 30, 40)
         cv2.putText(frame, "No Camera", (200, 220),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.5, (100, 100, 120), 2)
         cv2.putText(frame, "Connect webcam & restart server", (70, 270),
@@ -450,33 +489,27 @@ class CameraProcessor:
         jpeg = buf.tobytes()
         with self._frame_lock:
             self._latest_jpeg = jpeg
-        # 더미 프레임은 갱신할 필요 없으므로 대기만 함
         while self._running:
             time.sleep(1)
 
-    # ── 모자이크 익명화 (INN 대체 fallback) ──────────────────────────────
+    # ── 모자이크 익명화 (Gaussian Blur) ──────────────────────────────
 
     def _mosaic(self, frame: np.ndarray, x1, y1, x2, y2) -> np.ndarray:
         out = frame.copy()
-        
-        # 화면 밖으로 나가는 좌표 안전하게 보정
         h, w = out.shape[:2]
         bx1, by1 = max(0, int(x1)), max(0, int(y1))
         bx2, by2 = min(w, int(x2)), min(h, int(y2))
         
-        # 정상적인 박스 크기일 때만 블러 적용
         if bx2 > bx1 and by2 > by1:
             roi = out[by1:by2, bx1:bx2]
             if roi.size > 0:
-                blurred = cv2.GaussianBlur(roi, (99, 99), 30) # 가우시안 블러
+                blurred = cv2.GaussianBlur(roi, (99, 99), 30)
                 out[by1:by2, bx1:bx2] = blurred
-                
         return out
 
     # ── 프레임 처리 ───────────────────────────────────────────────────────
 
     def _maybe_downscale(self, frame: np.ndarray) -> np.ndarray:
-        """PROCESS_WIDTH 설정 시 처리 속도를 위해 프레임 축소."""
         pw = getattr(c, "PROCESS_WIDTH", 0)
         if pw and frame.shape[1] > pw:
             scale = pw / frame.shape[1]
@@ -485,17 +518,16 @@ class CameraProcessor:
 
     def _process(self, frame: np.ndarray) -> tuple[np.ndarray, int, int]:
         bboxes, kpss = self.detector.detect(frame, max_num=0, metric="default")
+        
+        # 사람이 없을 때 불필요한 연산 방지
         if bboxes is None or len(bboxes) == 0:
             return frame, 0, 0
 
         anonymize_all = getattr(c, "ANONYMIZE_ALL", False)
         emp, unk = 0, 0
-        tiles = []
-        
         for i in range(bboxes.shape[0]):
             x1, y1, x2, y2 = bboxes[i, :4].astype(int)
             lm = kpss[i]
-
             aligned = face_align.norm_crop(frame, landmark=lm, image_size=112)
             emb = self.recognizer.get_feat(aligned)
             name, group, sim = self._match(emb)
@@ -505,27 +537,35 @@ class CameraProcessor:
             else:
                 emp += 1
 
-            # 🚨 윗분들 지시사항 적용: 식별 안되면 무조건 블러
             if name == "Unknown" or anonymize_all:
                 frame = self._mosaic(frame, x1, y1, x2, y2)
-
-            # 박스 및 한글 텍스트 출력
             frame = self._draw(frame, x1, y1, x2, y2, name, group, sim)
-
-        with self._tiles_lock:
-            self._latest_tiles = tiles
         return frame, emp, unk
 
+    # ── pending 메모리 큐 API ──────────────────────────────────────────────
+
+    def pop_pending(self):
+        """가장 오래된 완성 pending 항목의 (frame, ts) 반환 후 삭제. 없으면 None."""
+        with self._pending_lock:
+            if not self._pending_records:
+                return None
+            return self._pending_records.pop(0)
+
+    def pending_size(self) -> int:
+        with self._pending_lock:
+            return len(self._pending_records)
+
+    def oldest_pending_ts(self) -> float | None:
+        """아직 처리 안 된 가장 오래된 대기 프레임의 촬영 시각. 큐 비면 None."""
+        with self._pending_lock:
+            if not self._pending_records:
+                return None
+            return self._pending_records[0][1]
 
     def make_protected(self, frame: np.ndarray) -> tuple[np.ndarray, list]:
-        """
-        녹화 전용: 원본 프레임을 INN 보호본으로 변환 (무거움, N초에 1번 호출).
-        Returns: (보호본 프레임, [{"tile_f32", "crop_box"}, ...])
-        """
         bboxes, kpss = self.detector.detect(frame, max_num=0, metric="default")
         if bboxes is None or len(bboxes) == 0:
             return frame, []
-
         anonymize_all = getattr(c, "ANONYMIZE_ALL", False)
         out = frame
         tiles = []
@@ -535,7 +575,6 @@ class CameraProcessor:
             aligned = face_align.norm_crop(out, landmark=lm, image_size=112)
             emb = self.recognizer.get_feat(aligned)
             name, group, sim = self._match(emb)
-
             if name == "Unknown" or anonymize_all:
                 if self._anonymizer is not None:
                     try:
@@ -559,21 +598,19 @@ class CameraProcessor:
                     s = _cosine_sim(emb, db_vec)
                     if s > best_sim:
                         best_sim = s
-                        # 문턱값(THRESHOLD) 못 넘기면 얄짤없이 Unknown
                         if s > c.MATCH_THRESHOLD:
                             best_name = db_name
                             best_group = db_group
         return best_name, best_group, best_sim
 
     def _draw(self, frame: np.ndarray, x1, y1, x2, y2, name, group, sim) -> np.ndarray:
-        if name != "Unknown":
-            color = (0, 200, 0) # 초록
-            label = "허가자"
+        if group == "허가":
+            color = (0, 200, 0)
         else:
-            color = (0, 0, 220) # 빨강
-            label = "비허가자"
+            color = (0, 0, 220)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label = f"외부인 ({sim:.2f})" if name == "Unknown" else f"{name} ({sim:.2f})"
         text_y = max(y1 - 28, 5)
         frame = _put_text(frame, label, (x1, text_y), 18, color)
         return frame

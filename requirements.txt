@@ -4,6 +4,11 @@
 insightface>=0.7.3
 onnxruntime>=1.16.0       # CPU 추론 (GPU: onnxruntime-gpu)
 
+# Hailo-8L 가속 (라즈베리파이 5, USE_HAILO=1일 때만 필요)
+# hailo_platform은 PyPI에 없음 — Hailo 공식 설치 가이드로 라즈베리파이에
+# HailoRT + 파이썬 바인딩을 설치해야 함 (pip install이 아니라 apt/dpkg 패키지).
+# https://hailo.ai/developer-zone/ 참고. PC 개발 환경에서는 설치 불필요.
+
 # INN 익명화 (PRO-Face S)
 torch>=2.0.0
 torchvision>=0.15.0

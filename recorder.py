@@ -109,19 +109,21 @@ class PSFRecorder:
 
     def _chunk_dir(self, ts: float | None = None) -> str:
         """
-        월/일/오전오후/시/10분청크 계층 폴더 경로를 만들고 반환.
+        월/일/오전오후/시/HH-MM-SS 청크 계층 폴더 경로를 만들고 반환.
         ts(촬영 시각)를 주면 그 시각 기준으로 청크를 분류 (recorder가
         뒤처져 나중에 처리해도 프레임이 올바른 시간대 청크에 저장됨).
         """
         import config as c
-        mins = getattr(c, "CHUNK_MINUTES", 10)
+        secs = getattr(c, "CHUNK_SECONDS", 60)
         now = datetime.fromtimestamp(ts) if ts else datetime.now()
         month = now.strftime("%Y-%m")            # 2026-06
         day = now.strftime("%d")                 # 29
         ampm = "오전" if now.hour < 12 else "오후"
         hour = f"{now.hour:02d}시"               # 14시
-        bucket = (now.minute // mins) * mins     # 10분 단위 내림
-        chunk = f"{now.hour:02d}-{bucket:02d}"   # 14-00
+        # 시(hour) 내 초 단위 버킷 → HH-MM-SS
+        sec_of_hour = now.minute * 60 + now.second
+        b = (sec_of_hour // secs) * secs
+        chunk = f"{now.hour:02d}-{b // 60:02d}-{b % 60:02d}"  # 14-00-20
         path = os.path.join(RECORDINGS_DIR, month, day, ampm, hour, chunk)
         os.makedirs(path, exist_ok=True)
         return path
@@ -167,21 +169,17 @@ class PSFRecorder:
                 last_chunk = chunk
             frame_id += 1
             snap_dir = os.path.join(chunk, f"{frame_id:06d}")
-            os.makedirs(snap_dir, exist_ok=True)
+            # 원자적 저장: 임시 폴더에 다 쓴 뒤 rename → 쓰기 도중 파일이
+            # tar 압축/복원에 잡혀 깨지는 것을 방지.
+            tmp_dir = snap_dir + ".tmp"
+            os.makedirs(tmp_dir, exist_ok=True)
 
-            # frame.jpg = INN 보호본 프레임 (얼굴 없으면 원본)
-            frame_path = os.path.join(snap_dir, "frame.jpg")
-            cv2.imwrite(frame_path, anon_frame)
-
-            # 프레임 촬영 시각 기록 (실제 시간 길이 복원용)
-            _save_json(os.path.join(snap_dir, "meta.json"), {"ts": ts})
-
-            # 타일 저장
+            cv2.imwrite(os.path.join(tmp_dir, "frame.jpg"), anon_frame)
+            _save_json(os.path.join(tmp_dir, "meta.json"), {"ts": ts})
             for i, td in enumerate(tiles):
-                npy_path = os.path.join(snap_dir, f"face_{i}.npy")
-                box_path = os.path.join(snap_dir, f"face_{i}_box.json")
-                np.save(npy_path, td["tile_f32"])
-                _save_json(box_path, td["crop_box"])
+                np.save(os.path.join(tmp_dir, f"face_{i}.npy"), td["tile_f32"])
+                _save_json(os.path.join(tmp_dir, f"face_{i}_box.json"), td["crop_box"])
+            os.replace(tmp_dir, snap_dir)  # 원자적 rename (완성된 폴더만 노출)
 
             # manifest 업데이트
             mpath = os.path.join(chunk, "manifest.json")
@@ -205,20 +203,36 @@ class PSFRecorder:
         print(f"[Recorder] 청크 완료: {_path_to_id(chunk_path)}")
 
     @staticmethod
-    def _chunk_past(chunk_id: str) -> bool:
-        """청크의 10분 시간대가 이미 지났는지 (지났으면 완료로 간주, 재시작 견고)."""
+    def _chunk_end_ts(chunk_id: str) -> float | None:
+        """청크의 끝 시각(epoch). chunk_id에서 파싱."""
         import config as c
         from datetime import timedelta
         try:
             parts = chunk_id.split("__")
             year, month = (int(x) for x in parts[0].split("-"))
             day = int(parts[1])
-            hh, mm = (int(x) for x in parts[4].split("-"))
-            start = datetime(year, month, day, hh, mm)
-            end = start + timedelta(minutes=getattr(c, "CHUNK_MINUTES", 10))
-            return datetime.now() > end
+            hms = parts[4].split("-")   # "14-00-20"
+            hh = int(hms[0]); mm = int(hms[1]); ss = int(hms[2]) if len(hms) > 2 else 0
+            start = datetime(year, month, day, hh, mm, ss)
+            end = start + timedelta(seconds=getattr(c, "CHUNK_SECONDS", 60))
+            return end.timestamp()
         except Exception:
+            return None
+
+    def _is_complete(self, chunk_id: str) -> bool:
+        """
+        청크가 완료됐는지 = 그 청크의 모든 프레임이 이미 저장됨(pending에 없음).
+        판정: 청크 끝시각 <= 아직 대기 중인 가장 오래된 프레임의 촬영시각.
+        (recorder가 그 청크 시간대를 다 지나쳐 처리했다는 뜻)
+        """
+        end = self._chunk_end_ts(chunk_id)
+        if end is None:
             return False
+        oldest = self._camera.oldest_pending_ts()
+        if oldest is None:
+            # 대기 큐가 비었으면, 시간대가 지난 청크는 완료
+            return end < datetime.now().timestamp()
+        return end <= oldest
 
     # ── 공개 API ──────────────────────────────────────────────────────────
 
@@ -234,7 +248,7 @@ class PSFRecorder:
             cid = _path_to_id(root)
             m["chunk_id"] = cid
             m["has_thumb"] = _first_frame_jpg(root) is not None
-            m["complete"] = m.get("complete", False) or self._chunk_past(cid)
+            m["complete"] = m.get("complete", False) or self._is_complete(cid)
             result.append(m)
         result.sort(key=lambda x: x.get("chunk_id", ""), reverse=True)
         return result
@@ -246,7 +260,7 @@ class PSFRecorder:
             return None
         m = _load_json(mpath) or {}
         m["chunk_id"] = chunk_id
-        m["complete"] = m.get("complete", False) or self._chunk_past(chunk_id)
+        m["complete"] = m.get("complete", False) or self._is_complete(chunk_id)
         frames = []
         if os.path.isdir(path):
             for fname in sorted(os.listdir(path)):
@@ -321,12 +335,13 @@ class PSFRecorder:
                     box_path = os.path.join(snap, f"face_{i}_box.json")
                     if not os.path.exists(npy_path):
                         break
-                    tile_f32 = np.load(npy_path)
-                    crop_box = _load_json(box_path)
                     try:
+                        tile_f32 = np.load(npy_path)  # 깨진 파일이면 예외
+                        crop_box = _load_json(box_path)
                         frame = anon.restore_roi(frame, tile_f32, crop_box, password)
                     except Exception as e:
-                        print(f"[RestoreVideo] {fid} face_{i} 실패: {e}")
+                        print(f"[RestoreVideo] {fid} face_{i} 건너뜀: {e}")
+                        continue
             else:
                 cv2.putText(frame, "INN checkpoint required", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 200), 2)
