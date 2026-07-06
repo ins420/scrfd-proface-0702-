@@ -604,13 +604,21 @@ class CameraProcessor:
         return best_name, best_group, best_sim
 
     def _draw(self, frame: np.ndarray, x1, y1, x2, y2, name, group, sim) -> np.ndarray:
-        if group == "허가":
-            color = (0, 200, 0)
+        # 상태에 따른 텍스트와 색상 설정 (Unknown 기준 판별)
+        if name != "Unknown":
+            color = (0, 200, 0) # 초록색
+            # 개인 이름 대신 '허가자'로 통일하고 유사도 표시
+            label = f"허가자 ({sim:.2f})" 
         else:
-            color = (0, 0, 220)
+            color = (0, 0, 220) # 빨간색
+            # '외부인' 대신 '비허가자'로 변경하고 유사도 표시
+            label = f"비허가자 ({sim:.2f})"
 
+        # 네모 테두리 그리기
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        label = f"외부인 ({sim:.2f})" if name == "Unknown" else f"{name} ({sim:.2f})"
+        
+        # 텍스트 위치 계산 및 기존 _put_text 함수로 한글 출력
         text_y = max(y1 - 28, 5)
         frame = _put_text(frame, label, (x1, text_y), 18, color)
+        
         return frame
