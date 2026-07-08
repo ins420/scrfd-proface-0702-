@@ -110,12 +110,12 @@ REALTIME_ANON = "mosaic"
 
 # 실시간 화면(모자이크 표시) 갱신 fps 상한.
 # 높을수록 화면이 부드러움.
-PROCESS_MAX_FPS = 15
+PROCESS_MAX_FPS = 20
 
 # pending 저장 fps (INN 보호본 대상). 복원 영상 부드러움의 기준.
 # 짧은 청크(20초)면 5fps여도 완성이 수 분이라 감당 가능. 높일수록 부드럽지만
 # 청크 완성이 느려짐(INN 0.4fps 처리라 큐가 쌓임).
-SAVE_FPS = 5
+SAVE_FPS = 15
 
 # (구) 프레임 스킵. 시간 기반 PROCESS_MAX_FPS를 쓰므로 1로 둠.
 PROCESS_EVERY_N = 1
@@ -173,4 +173,5 @@ MODAL_RESTORE_URL = "https://yena07--securefacerx-restore-restore.modal.run"
 # ffmpeg 실행 파일 경로 (None이면 PATH에서 탐색).
 # 브라우저 호환 H.264 변환에 사용.
 # winget 설치 시 PATH에 없을 수 있어 직접 지정.
-FFMPEG_PATH = r"C:\Users\HOSEO\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
+#FFMPEG_PATH = r"C:\Users\HOSEO\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
+FFMPEG_PATH = "ffmpeg"  # PATH에 있으면 그냥 ffmpeg로 됨

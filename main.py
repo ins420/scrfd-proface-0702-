@@ -34,8 +34,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from insightface.utils import face_align
 from pydantic import BaseModel
+from insightface.utils import face_align
+
+import torch  # GPU 메모리 및 컨텍스트 관리용 추가
 
 import config as c
 from camera_stream import (
@@ -76,16 +78,35 @@ def _init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global camera, recorder
+    
+    # 1. 시스템 DB 초기화
     _init_db()
+    
+    # 2. GPU(CUDA) 상태 초기화 (메모리 파편화 방지)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print("✅ CUDA is available. GPU 메모리 정리를 완료했습니다.")
+    else:
+        print("⚠️ CUDA is unavailable. CPU 모드로 동작합니다.")
+
+    # 3. CameraProcessor 초기화 (내부에서 Hailo 및 INN 모델 로드)
     camera = CameraProcessor()
     camera.start(cam_id=getattr(c, "CAMERA_INDEX", 0))
+    
+    # 4. Recorder 초기화 및 시작
     recorder = PSFRecorder(camera, interval_sec=getattr(c, "RECORD_INTERVAL", 5))
     recorder.start()
-    yield
+    
+    yield  # --- 서버 가동 중 ---
+    
+    # 5. 서버 종료 시 안전한 자원 해제
     if recorder:
         recorder.stop()
     if camera:
         camera.stop()
+        
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ── 앱 초기화 ─────────────────────────────────────────────────────────────
@@ -443,9 +464,14 @@ class RestoreRequest(BaseModel):
 async def api_restore(req: RestoreRequest):
     if recorder is None:
         raise HTTPException(status_code=503, detail="Recorder not ready")
-    data = recorder.restore_frame(req.chunk_id, req.frame_id, req.password)
+        
+    # 역변환(추론) 시 그래디언트 계산 방지 및 GPU 안전 확보
+    with torch.no_grad():
+        data = recorder.restore_frame(req.chunk_id, req.frame_id, req.password)
+        
     if data is None:
         raise HTTPException(status_code=404, detail="프레임을 찾을 수 없습니다.")
+        
     encoded = base64.b64encode(data).decode()
     return {"status": "ok", "image_base64": f"data:image/jpeg;base64,{encoded}"}
 
@@ -460,13 +486,40 @@ class RestoreVideoRequest(BaseModel):
 async def api_restore_video(req: RestoreVideoRequest):
     if recorder is None:
         raise HTTPException(status_code=503, detail="Recorder not ready")
-    path = await asyncio.to_thread(
-        recorder.restore_chunk_video, req.chunk_id, req.password
-    )
+        
+    # 동영상 복원은 다량의 프레임을 처리하므로 VRAM 관리가 필수
+    with torch.no_grad():
+        path = await asyncio.to_thread(
+            recorder.restore_chunk_video, req.chunk_id, req.password
+        )
+        
+    # 작업 완료 후 캐시 즉시 반환
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     if path is None or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="복원할 프레임이 없습니다.")
+        
     return FileResponse(path, media_type="video/mp4", filename="restored.mp4")
 
+
+@app.post("/api/restore_video_gpu")
+async def api_restore_video_gpu(req: RestoreVideoRequest):
+    if recorder is None:
+        raise HTTPException(status_code=503, detail="Recorder not ready")
+        
+    with torch.no_grad():
+        path = await asyncio.to_thread(
+            recorder.restore_chunk_video, req.chunk_id, req.password
+        )
+        
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
+    if path is None or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="복원할 프레임이 없습니다.")
+        
+    return FileResponse(path, media_type="video/mp4", filename="restored_gpu.mp4")
 
 # ── 직접 실행 ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
