@@ -48,3 +48,6 @@ pending/
 # OS
 .DS_Store
 Thumbs.db
+
+*.log
+.install_logs/

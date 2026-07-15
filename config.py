@@ -5,6 +5,7 @@ SecureFace-RX 전역 설정
 
 import os
 import torch
+import platform
 
 # ─── 디바이스 (zxc.txt 기준) ──────────────────────────────────────
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -122,11 +123,11 @@ PROCESS_EVERY_N = 1
 
 # recorder가 뒤처질 때 원본 프레임을 쌓아두는 큐 최대 크기(장).
 # 클수록 프레임을 덜 버리지만 메모리↑ (JPEG 압축 저장, 장당 ~50KB).
-FRAME_QUEUE_MAX = 3000
+FRAME_QUEUE_MAX = 10
 
 # 처리 전 프레임 가로 해상도 축소(px).
 # 0이면 원본. 탐지 속도↑.
-PROCESS_WIDTH = 0
+PROCESS_WIDTH = 640
 
 # 카메라 종류: "webcam"(cv2.VideoCapture) 또는 "realsense"(pyrealsense2)
 # RealSense D455도 UVC 장치라 OpenCV(webcam)로 컬러 스트림을 받을 수 있음.
@@ -162,7 +163,7 @@ RECORD_INTERVAL = 0
 
 # 청크 길이(초). 짧을수록 완성이 빨라 데모에 유리. 20초 권장.
 # 저장 계층: recordings/월/일/오전오후/시/HH-MM-SS 청크
-CHUNK_SECONDS = 20
+CHUNK_SECONDS = 600
 
 # 복원 영상 출력 fps (부드러움용). 실제 영상 길이는 프레임 타임스탬프로 맞춰짐.
 RESTORE_VIDEO_FPS = 15
@@ -175,3 +176,19 @@ MODAL_RESTORE_URL = "https://yena07--securefacerx-restore-restore.modal.run"
 # winget 설치 시 PATH에 없을 수 있어 직접 지정.
 #FFMPEG_PATH = r"C:\Users\HOSEO\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin\ffmpeg.exe"
 FFMPEG_PATH = "ffmpeg"  # PATH에 있으면 그냥 ffmpeg로 됨
+
+INN_ONNX_PROTECT = "checkpoints/inn_protect.onnx"
+
+# ─── 디스크 I/O 최적화 (Ramdisk & SD 하이브리드 설정) ────────────────────────
+if platform.system() == "Linux":
+    # 라즈베리파이: 실시간 저장은 RAM, 영구 보관은 SD카드
+    RECORD_RAM_DIR = "/dev/shm/SecureFace_recordings"
+    RECORD_SD_DIR = "recordings"
+else:
+    # 윈도우/맥 (로컬 테스트용): 구별할 필요 없이 기존 폴더 사용
+    RECORD_RAM_DIR = "recordings"
+    RECORD_SD_DIR = "recordings"
+
+# 폴더가 없으면 미리 생성
+os.makedirs(RECORD_RAM_DIR, exist_ok=True)
+os.makedirs(RECORD_SD_DIR, exist_ok=True)

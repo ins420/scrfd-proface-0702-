@@ -40,6 +40,8 @@ from insightface.utils import face_align
 import torch  # GPU 메모리 및 컨텍스트 관리용 추가
 
 import config as c
+from fastapi.staticfiles import StaticFiles
+
 from camera_stream import (
     CameraProcessor,
     DB_PATH,
@@ -119,7 +121,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 templates = Jinja2Templates(directory="templates")
-
+app.mount("/recordings", StaticFiles(directory=c.RECORD_RAM_DIR), name="recordings")
 
 # ── 페이지 ───────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
@@ -353,7 +355,7 @@ async def api_register_continuous_realsense(data: RegisterContinuous):
 
     print(f"▶ [{data.name}] 연속 촬영 등록 시작...")
     
-    capture_duration = 3.0  # 3초간 캡처
+    capture_duration = 5.0  # 5초간 캡처
     interval = 0.2          # 0.2초 간격 (초당 5프레임)
     max_frames = int(capture_duration / interval)
     
@@ -520,6 +522,8 @@ async def api_restore_video_gpu(req: RestoreVideoRequest):
         raise HTTPException(status_code=404, detail="복원할 프레임이 없습니다.")
         
     return FileResponse(path, media_type="video/mp4", filename="restored_gpu.mp4")
+
+
 
 # ── 직접 실행 ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":

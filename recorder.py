@@ -18,12 +18,13 @@ import json
 import os
 import threading
 import time
+import shutil
 from datetime import datetime
-
 import cv2
 import numpy as np
+import config as c
 
-RECORDINGS_DIR = "recordings"
+RECORDINGS_DIR = getattr(c, "RECORD_RAM_DIR", "recordings")
 
 
 # ── JSON 유틸 ──────────────────────────────────────────────────────────────
@@ -35,6 +36,40 @@ def _load_json(path: str) -> dict | None:
     except Exception:
         return None
 
+# ── 그림자 백업 (Shadow Backup) ──────────────────────────────────────────
+def backup_chunk_to_sd(ram_chunk_path: str):
+    """메인 시스템에 부하를 주지 않고 뒤에서 조용히 SD카드로 복사하는 thread"""
+    ram_base = getattr(c, "RECORD_RAM_DIR", "recordings")
+    sd_base = getattr(c, "RECORD_SD_DIR", "recordings")
+    
+    # 윈도우/맥처럼 RAM과 SD 경로가 동일하면 복사할 필요 없음
+    if ram_base == sd_base:
+        return
+
+    def _copy_task():
+        t_start = time.time()
+
+        try:
+            # RAM 경로에서 상대 경로(예: 2026-07/14/오후/14시/14-00-00)만 추출
+            rel_path = os.path.relpath(ram_chunk_path, ram_base)
+            sd_path = os.path.join(sd_base, rel_path)
+            
+            # SD카드 쪽에 폴더 만들고 통째로 덮어쓰기 복사
+            os.makedirs(os.path.dirname(sd_path), exist_ok=True)
+            shutil.copytree(ram_chunk_path, sd_path, dirs_exist_ok=True)
+            # 💡 [추가] 복사 소요 시간 계산
+            elapsed = time.time() - t_start
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            
+            # 💡 [추가] 요구하신 "26-07-15 13시 00분" 포맷 생성
+            now_str = datetime.now().strftime("%y-%m-%d %H시 %M분")
+            print(f"[Backup] 💾 쉐도우 백업 완료 (SD카드 저장됨): {sd_path}")
+        except Exception as e:
+            print(f"[Backup Error] ❌ 쉐도우 백업 실패: {e}")
+
+    # 데몬 스레드로 실행 (메인 서버가 꺼지면 같이 종료됨)
+    threading.Thread(target=_copy_task, daemon=True).start()
 
 def _json_default(o):
     """numpy 정수/실수/배열을 JSON 직렬화 가능 타입으로 변환."""
@@ -48,8 +83,10 @@ def _json_default(o):
 
 
 def _save_json(path: str, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
+    os.replace(tmp_path, path)
 
 
 def _sha256(path: str) -> str:
@@ -73,13 +110,27 @@ def _first_frame_jpg(chunk_path: str) -> str | None:
 # 실제 경로:  recordings/2026-06/29/오후/14시/14-00
 # chunk_id : "2026-06__29__오후__14시__14-00"  (슬래시 → __, URL 안전)
 def _path_to_id(chunk_path: str) -> str:
-    rel = os.path.relpath(chunk_path, RECORDINGS_DIR)
+    """
+    RAM이나 SD 어디서든 기준 디렉토리를 떼어내어 순수한 상대 경로로 ID 생성.
+    """
+    # RAM 디스크 경로에 속해 있다면 RECORD_RAM_DIR 기준으로 상대경로 추출
+    if getattr(c, "RECORD_RAM_DIR", "recordings") in chunk_path:
+        rel = os.path.relpath(chunk_path, getattr(c, "RECORD_RAM_DIR", "recordings"))
+    # SD 카드 경로에 속해 있다면 RECORD_SD_DIR 기준으로 추출
+    else:
+        rel = os.path.relpath(chunk_path, getattr(c, "RECORD_SD_DIR", "recordings"))
     return rel.replace(os.sep, "__").replace("/", "__")
 
 
 def _id_to_path(chunk_id: str) -> str:
+    """
+    1순위로 RAM 디스크(오늘 데이터)에 파일이 있는지 확인하고,
+    없으면 2순위로 SD 카드(과거 데이터)에서 파일을 찾아 반환.
+    """
     rel = chunk_id.replace("__", os.sep)
-    return os.path.join(RECORDINGS_DIR, rel)
+    ram_path = os.path.join(getattr(c, "RECORD_RAM_DIR", "recordings"), rel)
+    sd_path = os.path.join(getattr(c, "RECORD_SD_DIR", "recordings"), rel)
+    return ram_path if os.path.exists(ram_path) else sd_path
 
 
 # ── PSFRecorder ────────────────────────────────────────────────────────────
@@ -134,15 +185,17 @@ class PSFRecorder:
         save_count = 0
         t_report = time.time()
         proc_ms = 0.0
+        
+        # 💡 [추가] 현재 청크의 시작 시간 기록
+        chunk_start_time = time.time()
+        
         while self._running:
             if self._interval > 0:
                 time.sleep(self._interval)
 
-            # pending 디스크 큐에서 원본 하나를 꺼내 detect + INN 보호본 생성
-            # (실시간을 안 따라가도 큐에 쌓인 모든 프레임을 결국 다 처리)
             popped = self._camera.pop_pending()
             if popped is None:
-                time.sleep(0.05)  # 큐 비어있음
+                time.sleep(0.05)
                 continue
             raw, ts = popped
             _t0 = time.time()
@@ -150,7 +203,6 @@ class PSFRecorder:
             proc_ms = (time.time() - _t0) * 1000
             save_count += 1
 
-            # 실제 저장 속도 + 대기 큐 크기 주기적 로그
             if time.time() - t_report >= 5.0:
                 fps = save_count / (time.time() - t_report)
                 qsize = self._camera.pending_size()
@@ -159,18 +211,29 @@ class PSFRecorder:
                 save_count = 0
                 t_report = time.time()
 
-            # 모든 프레임 저장. 청크는 촬영 시각(ts) 기준으로 분류.
             chunk = self._chunk_dir(ts)
-            # 청크(10분)가 바뀌면 이전 청크를 완료 표시하고 프레임 번호 리셋
+            
             if chunk != last_chunk:
                 if last_chunk is not None:
+                    # 💡 [추가] RAM 디스크 녹화 완료 소요 시간 계산
+                    elapsed_ram = time.time() - chunk_start_time
+                    r_mins = int(elapsed_ram // 60)
+                    r_secs = int(elapsed_ram % 60)
+                    now_str = datetime.now().strftime("%y-%m-%d %H시 %M분")
+                    
                     self._mark_complete(last_chunk)
+                    # 💡 [추가] RAM 청크 완료 알림 출력
+                    print(f"[{now_str}] 🐏 RAM 청크 저장 완료, {r_mins}분 {r_secs}초 소요")
+                    
+                    backup_chunk_to_sd(last_chunk)  # 섀도우 백업 시작
+                
+                # 💡 [추가] 다음 청크를 위한 타이머 리셋
+                chunk_start_time = time.time()
                 frame_id = 0
                 last_chunk = chunk
+                
             frame_id += 1
             snap_dir = os.path.join(chunk, f"{frame_id:06d}")
-            # 원자적 저장: 임시 폴더에 다 쓴 뒤 rename → 쓰기 도중 파일이
-            # tar 압축/복원에 잡혀 깨지는 것을 방지.
             tmp_dir = snap_dir + ".tmp"
             os.makedirs(tmp_dir, exist_ok=True)
 
@@ -179,9 +242,8 @@ class PSFRecorder:
             for i, td in enumerate(tiles):
                 np.save(os.path.join(tmp_dir, f"face_{i}.npy"), td["tile_f32"])
                 _save_json(os.path.join(tmp_dir, f"face_{i}_box.json"), td["crop_box"])
-            os.replace(tmp_dir, snap_dir)  # 원자적 rename (완성된 폴더만 노출)
+            os.replace(tmp_dir, snap_dir)
 
-            # manifest 업데이트
             mpath = os.path.join(chunk, "manifest.json")
             m = _load_json(mpath) or {
                 "chunk_id": _path_to_id(chunk),
@@ -237,20 +299,61 @@ class PSFRecorder:
     # ── 공개 API ──────────────────────────────────────────────────────────
 
     def list_chunks(self) -> list[dict]:
-        """녹화된 청크 목록 (최신순). 계층 폴더를 재귀 탐색."""
-        result = []
-        if not os.path.exists(RECORDINGS_DIR):
-            return result
-        for root, _dirs, files in os.walk(RECORDINGS_DIR):
-            if "manifest.json" not in files:
-                continue
-            m = _load_json(os.path.join(root, "manifest.json")) or {}
-            cid = _path_to_id(root)
-            m["chunk_id"] = cid
-            m["has_thumb"] = _first_frame_jpg(root) is not None
-            m["complete"] = m.get("complete", False) or self._is_complete(cid)
-            result.append(m)
+        """
+        RAM 디스크와 SD 카드를 모두 스캔하여 중복 없이 하나의 통합 청크 목록을 반환.
+        """
+        merged_chunks = {}
+        ram_base = getattr(c, "RECORD_RAM_DIR", "recordings")
+        sd_base = getattr(c, "RECORD_SD_DIR", "recordings")
+
+        # 헬퍼 함수: 특정 디렉토리를 긁어 중복 제거하며 딕셔너리에 추가
+        def scan_directory(base_dir: str):
+            if not os.path.exists(base_dir):
+                return
+            
+            # 계층 폴더 스캔 시작
+            for month_dir in sorted(os.listdir(base_dir), reverse=True):
+                m_path = os.path.join(base_dir, month_dir)
+                if not os.path.isdir(m_path): continue
+                
+                for day_dir in sorted(os.listdir(m_path), reverse=True):
+                    d_path = os.path.join(m_path, day_dir)
+                    if not os.path.isdir(d_path): continue
+
+                    for ampm in ["오후", "오전"]:
+                        a_path = os.path.join(d_path, ampm)
+                        if not os.path.exists(a_path): continue
+                        
+                        for hour_dir in sorted(os.listdir(a_path), reverse=True):
+                            h_path = os.path.join(a_path, hour_dir)
+                            if not os.path.isdir(h_path): continue
+                            
+                            for chunk_name in sorted(os.listdir(h_path), reverse=True):
+                                c_path = os.path.join(h_path, chunk_name)
+                                mpath = os.path.join(c_path, "manifest.json")
+                                if os.path.exists(mpath):
+                                    m = _load_json(mpath) or {}
+                                    cid = _path_to_id(c_path)
+                                    m["chunk_id"] = cid
+                                    m["has_thumb"] = _first_frame_jpg(c_path) is not None
+                                    m["complete"] = m.get("complete", False) or self._is_complete(cid)
+                                    
+                                    # 이미 딕셔너리에 동일한 cid가 등록되어 있다면 건너뛰거나 덮어쓰기
+                                    # (RAM 스캔을 나중에 돌릴 것이므로 RAM 데이터가 자연스럽게 우선 적용됩니다)
+                                    merged_chunks[cid] = m
+
+        # 1단계: 영구 보관용 SD 카드 먼저 스캔 (과거 데이터 로드)
+        if ram_base != sd_base:
+            scan_directory(sd_base)
+            
+        # 2단계: 실시간 RAM 디스크 스캔 (오늘 데이터로 덮어쓰기 및 추가)
+        scan_directory(ram_base)
+
+        # 결과 리스트 변환 및 최신순 정렬
+        result = list(merged_chunks.values())
         result.sort(key=lambda x: x.get("chunk_id", ""), reverse=True)
+        
+        # 넉넉하게 최근 200개 반환 (성능을 조율하기 위해 필요에 따라 조절)
         return result
 
     def get_chunk_detail(self, chunk_id: str) -> dict | None:
@@ -356,8 +459,14 @@ class PSFRecorder:
             if idx < len(frame_dirs) - 1 and ts_list[idx] > 0 and ts_list[idx + 1] > 0:
                 dur = ts_list[idx + 1] - ts_list[idx]
             else:
-                dur = 1.0 / out_fps
-            hold = max(1, min(round(dur * out_fps), out_fps * 30))  # 최대 30초/프레임
+                chunk_sec = getattr(c, "CHUNK_SECONDS", 600)
+                if len(ts_list) > 0 and ts_list[0] > 0:
+                    elapsed = ts_list[-1] - ts_list[0]
+                    dur = max(1.0 / out_fps, chunk_sec - elapsed)
+                else:
+                    dur = 1.0 / out_fps
+            
+            hold = max(1, round(dur * out_fps))
             for _ in range(hold):
                 writer.write(frame)
 
